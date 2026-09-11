@@ -7,9 +7,16 @@
 // always produces a usable lesson.
 //
 // Default chain (auto-detected from whichever keys are present):
-//   Gemini  →  OpenRouter (free model)  →  Anthropic  →  OpenAI  →  mock
+//   Gemini  →  OpenRouter (free)  →  Vercel AI Gateway  →  Anthropic  →  OpenAI  →  mock
 //
 // Override with LLM_PROVIDER (pins a single primary) and LLM_FALLBACK_PROVIDER.
+//
+// This module holds API keys and provider clients, so it must never reach the
+// browser. "server-only" makes that a build error rather than a convention: any
+// client component that imports it as a value (a type-only import is erased and
+// stays fine) fails the build instead of silently shipping this to the client.
+
+import "server-only";
 
 import { z } from "zod";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
@@ -33,21 +40,33 @@ import {
 export type Provider =
   | "gemini"
   | "openrouter"
+  | "vercel"
   | "anthropic"
   | "openai"
   | "mock";
 
+// Order matters: the keyless-cheapest options first, then direct provider keys.
 const REAL_PROVIDERS: Exclude<Provider, "mock">[] = [
   "gemini",
   "openrouter",
+  "vercel",
   "anthropic",
   "openai",
 ];
 
 const DEFAULT_MODELS: Record<Exclude<Provider, "mock">, string> = {
-  gemini: "gemini-2.5-flash",
-  // A capable free model on OpenRouter that supports tool/structured output.
-  openrouter: "meta-llama/llama-3.3-70b-instruct:free",
+  gemini: "gemini-3.6-flash",
+  // Free models get retired from OpenRouter regularly (this slot previously held
+  // llama-3.3-70b:free, which is now paid-only), so prefer one that is currently
+  // free AND reliably emits valid JSON for our prompts. "openrouter/free" is the
+  // rot-proof alternative — it auto-routes across whatever is free today — but it
+  // is slower and less predictable, so we pin a specific model here.
+  openrouter: "nvidia/nemotron-3-super-120b-a12b:free",
+  // The gateway fronts many providers under "vendor/model" slugs. Defaulting to
+  // the same model family as the primary keeps question quality consistent when
+  // this backup takes over, while drawing on Vercel's quota rather than the
+  // Gemini free tier that just ran out. Full list: https://ai-gateway.vercel.sh/v1/models
+  vercel: "google/gemini-3-flash",
   anthropic: "claude-sonnet-5",
   openai: "gpt-4o",
 };
@@ -58,6 +77,12 @@ function keyFor(provider: Provider): string | undefined {
       return process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
     case "openrouter":
       return process.env.OPENROUTER_API_KEY;
+    case "vercel":
+      // AI_GATEWAY_API_KEY is the name the Vercel AI SDK itself looks for, and
+      // it is injected automatically on Vercel deployments.
+      return (
+        process.env.AI_GATEWAY_API_KEY || process.env.VERCEL_AI_GATEWAY_API_KEY
+      );
     case "anthropic":
       return process.env.ANTHROPIC_API_KEY;
     case "openai":
@@ -116,6 +141,10 @@ async function buildModel(
       return new ChatGoogleGenerativeAI({
         model: process.env.GEMINI_MODEL || DEFAULT_MODELS.gemini,
         temperature: 0.3,
+        // Default is 6 retries with backoff. A free-tier daily quota is not
+        // going to clear in the next 30 seconds, and retrying it turned a
+        // failover into a 100s stall, so give up fast and let the chain work.
+        maxRetries: 1,
         apiKey,
       });
     }
@@ -124,11 +153,27 @@ async function buildModel(
       return new ChatOpenAI({
         model: process.env.OPENROUTER_MODEL || DEFAULT_MODELS.openrouter,
         temperature: 0.3,
+        maxRetries: 1,
         apiKey,
         configuration: {
           baseURL: "https://openrouter.ai/api/v1",
-          defaultHeaders: { "X-Title": "Memorang Lesson Agent" },
+          defaultHeaders: { "X-Title": "PDF Lesson Agent" },
         },
+      });
+    }
+    case "vercel": {
+      // The gateway speaks the OpenAI wire format, so the OpenAI client works
+      // against it unchanged — same trick as the OpenRouter branch above.
+      const { ChatOpenAI } = await import("@langchain/openai");
+      return new ChatOpenAI({
+        model:
+          process.env.AI_GATEWAY_MODEL ||
+          process.env.VERCEL_AI_GATEWAY_MODEL ||
+          DEFAULT_MODELS.vercel,
+        temperature: 0.3,
+        maxRetries: 1,
+        apiKey,
+        configuration: { baseURL: "https://ai-gateway.vercel.sh/v1" },
       });
     }
     case "anthropic": {
@@ -162,10 +207,11 @@ async function getCandidateModels(): Promise<BaseChatModel[]> {
   return models;
 }
 
-/** The primary model (first in the chain), used by the CopilotKit tutor chat. */
-export async function createChatModel(): Promise<BaseChatModel | null> {
-  const chain = resolveProviderChain();
-  return chain.length ? buildModel(chain[0]) : null;
+/** Every model in the chain, in order — used by the CopilotKit tutor chat so it
+ *  degrades through the same providers the lesson does instead of erroring in
+ *  the sidebar the moment the primary hits a rate limit. */
+export async function createChatModels(): Promise<BaseChatModel[]> {
+  return getCandidateModels();
 }
 
 // --- Structured generation with chain fallback ------------------------------
@@ -321,6 +367,35 @@ export async function generatePlan(
   return mockPlan(title, sourceText);
 }
 
+const OPTION_IDS = ["a", "b", "c", "d"] as const;
+
+/**
+ * Deal the options into a random order and re-letter them.
+ *
+ * Models have a strong positional bias: asked to write an MCQ, they overwhelmingly
+ * put the correct answer first and mark it "a". Measured on this prompt, "a" was
+ * correct 3 times out of 4 — a learner who always picks the first option scores far
+ * better than chance. Shuffling server-side fixes that for every provider at once,
+ * and costs nothing, whereas asking the model to vary the position is unreliable.
+ */
+function shuffleOptions(
+  options: MCQ["options"],
+  correctOptionId: string,
+): { options: MCQ["options"]; correctOptionId: string } {
+  const correctText = options.find((o) => o.id === correctOptionId)?.text;
+  const texts = options.map((o) => o.text);
+  for (let i = texts.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [texts[i], texts[j]] = [texts[j], texts[i]];
+  }
+  const shuffled = texts.map((text, i) => ({ id: OPTION_IDS[i], text }));
+  const moved = shuffled.find((o) => o.text === correctText);
+  // If the correct text somehow went missing, keep the model's own ordering
+  // rather than silently mis-marking the answer.
+  if (!moved) return { options, correctOptionId };
+  return { options: shuffled, correctOptionId: moved.id };
+}
+
 export async function generateMCQ(
   objective: LearningObjective,
   sourceText: string,
@@ -339,11 +414,12 @@ export async function generateMCQ(
     MCQ_SHAPE,
   );
   if (raw) {
+    const dealt = shuffleOptions(raw.options, raw.correctOptionId);
     return {
       objectiveId: objective.id,
       question: raw.question,
-      options: raw.options,
-      correctOptionId: raw.correctOptionId,
+      options: dealt.options,
+      correctOptionId: dealt.correctOptionId,
       explanation: raw.explanation,
       hint: raw.hint,
     };

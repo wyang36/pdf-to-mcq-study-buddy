@@ -3,7 +3,7 @@ import "./globals.css";
 import "@copilotkit/react-ui/styles.css";
 
 export const metadata: Metadata = {
-  title: "Memorang · PDF → Interactive Lesson",
+  title: "PDF → Interactive Lesson",
   description:
     "An AI learning agent that turns a PDF into a planned, quiz-driven lesson with human-in-the-loop approval.",
 };

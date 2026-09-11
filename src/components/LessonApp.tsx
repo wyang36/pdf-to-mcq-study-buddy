@@ -156,7 +156,7 @@ export function LessonApp({
         <div className="mx-auto flex max-w-4xl items-center justify-between px-4 py-3">
           <div className="flex items-center gap-2">
             <span className="text-xl">🧠</span>
-            <span className="font-semibold text-gray-900">Memorang Lesson Agent</span>
+            <span className="font-semibold text-gray-900">PDF Lesson Agent</span>
           </div>
           <div className="flex items-center gap-3 text-xs text-gray-500">
             <span className="rounded-full bg-gray-100 px-2 py-0.5" title="Active LLM fallback chain">
@@ -279,7 +279,7 @@ export function LessonApp({
           title: "Study Buddy",
           initial:
             provider === "mock"
-              ? "Tutor chat needs an API key. Add ANTHROPIC_API_KEY or OPENAI_API_KEY and restart the server to chat with me."
+              ? "Tutor chat needs an API key. Add GEMINI_API_KEY (or any other provider key) to .env.local and restart the server to chat with me."
               : "Hi! I'm your tutor. Ask me to explain a concept or give you a hint — but I won't give away the answer. 😉",
         }}
         instructions={TUTOR_INSTRUCTIONS}

@@ -1,5 +1,5 @@
 {
-  "name": "memorang-lesson-agent",
+  "name": "pdf-lesson-agent",
   "version": "0.1.0",
   "private": true,
   "description": "AI learning agent that turns a PDF into an interactive, quiz-driven lesson (LangGraph.js + CopilotKit).",
@@ -11,9 +11,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@copilotkit/react-core": "^1.8.14",
-    "@copilotkit/react-ui": "^1.8.14",
-    "@copilotkit/runtime": "^1.8.14",
+    "@copilotkit/react-core": "1.8.14",
+    "@copilotkit/react-ui": "1.8.14",
+    "@copilotkit/runtime": "1.8.14",
     "@langchain/anthropic": "^0.3.14",
     "@langchain/core": "^0.3.40",
     "@langchain/google-genai": "^0.2.18",
@@ -23,6 +23,7 @@
     "pdfjs-dist": "^4.10.38",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "server-only": "^0.0.1",
     "zod": "^3.24.1"
   },
   "devDependencies": {

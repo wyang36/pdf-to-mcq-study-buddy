@@ -1,169 +1,137 @@
-# 🧠 Memorang Lesson Agent
+# PDF → Interactive Lesson Agent
 
-An AI learning agent that turns a **PDF into an interactive, quiz-driven lesson** — with a human-in-the-loop plan approval step, custom MCQ widgets, green/red feedback with hints and explanations, and a personalized wrap-up.
+Turns an uploaded PDF into a quiz-driven lesson: the agent drafts a lesson plan, pauses for human approval, then generates one multiple-choice question per objective, grades answers, hints on misses, and writes a personalized wrap-up.
 
-Built with **LangGraph.js** (agent orchestration + real interrupt-based HITL) and **CopilotKit** (tutor chat + generative context), fully in **TypeScript** on **Next.js**. It runs against a configurable **LLM fallback chain** (Gemini → a free OpenRouter model → Anthropic → OpenAI), and ships with a **deterministic mock mode** so you can run and demo the entire flow with no API key.
-
----
-
-## The flow
-
-```
-Upload PDF ──► Agent extracts text ──► Drafts a lesson plan (objectives + difficulty)
-                                             │
-                                   ◄── HITL: you review / edit / approve ──►
-                                             │
-        ┌────────────────────────────────────┴───────────────────────────┐
-        │  For each objective:                                            │
-        │    • Agent generates an MCQ from the PDF                         │
-        │    • Widget renders question + radio choices + submit            │
-        │    • Correct  → green highlight + explanation → continue         │
-        │    • Incorrect→ red highlight + hint → retry (no penalty)        │
-        │    • Tutor chat can explain / hint — but never reveals the answer│
-        └────────────────────────────────────┬───────────────────────────┘
-                                             │
-                              Summary: score, strengths, focus areas, study tips
-```
-
-Each arrow marked **HITL** is a genuine LangGraph `interrupt()` — the graph pauses, the server returns the pending question to the browser, and only resumes when you send a decision back via a `Command`.
-
----
-
-## How it maps to the acceptance criteria
-
-| Criterion | Where |
-| --- | --- |
-| Accepts a PDF upload and parses relevant content | [`/api/extract-pdf`](src/app/api/extract-pdf/route.ts) (`pdfjs-dist`) + [`PdfUpload`](src/components/PdfUpload.tsx) |
-| Presents a plan (objectives + difficulty) for generation | `make_plan` node in [`graph.ts`](src/agent/graph.ts), rendered by [`PlanApproval`](src/components/PlanApproval.tsx) |
-| HITL interrupt to review the plan before proceeding | `approve_plan` node → `interrupt()`; resumed from the UI |
-| MCQs generated directly from the PDF content | `generate_question` node → [`generateMCQ`](src/agent/llm.ts) (prompt is grounded in the extracted text) |
-| MCQ widget renders with radio selection | [`McqCard`](src/components/McqCard.tsx) |
-| Correct answer → explanation displayed | `reveal` node returns the explanation; green highlight in `McqCard` |
-| Incorrect answer → hint + retry without penalty | `ask_question` loops back through a graph edge; attempts are tracked but never block progress |
-| Proceed through all MCQs until completion | `advance` node + conditional edges iterate every objective |
-| Summary of results + study tips at the end | `summarize` node → [`SummaryCard`](src/components/SummaryCard.tsx) |
-| "Learn more / hint" without giving away the answer | CopilotKit tutor sidebar; the correct option **never leaves the server** (see below) |
-
----
+**Stack:** LangGraph.js (orchestration + `interrupt()`-based HITL), CopilotKit (tutor chat), Next.js App Router, TypeScript, Tailwind. Model access goes through a configurable fallback chain ending in a deterministic offline mock, so the full flow runs with no API key.
 
 ## Quick start
 
-**Requirements:** Node 20+ (tested on Node 22).
+Requires Node 20+ (tested on 22).
 
 ```bash
 npm install
-cp .env.example .env.local     # optional — see "Configuring the LLM" below
+cp .env.example .env.local     # optional; without keys it runs in mock mode
 npm run dev
 ```
 
-Open http://localhost:3000, upload a text-based PDF, and go.
+Open http://localhost:3000 and upload a text-based PDF.
 
-> **No API key?** It just works in **mock mode** — the plan and questions are generated with offline heuristics so you can click through the whole flow. The tutor chat is the only thing that needs a real model.
+## LLM configuration
 
----
-
-## Configuring the LLM
-
-The agent uses a **fallback chain**: for every generation it tries the primary model, and on any error (bad key, rate limit, unsupported output) falls through to the next — ending at an offline mock so the app never hard-fails. The active chain is shown in the app header (e.g. `LLM: gemini → openrouter`).
-
-**Recommended setup — Gemini primary + a free OpenRouter backup:**
+Every generation walks a fallback chain: on any error (bad key, rate limit, malformed output) it tries the next provider, ending at an offline mock. The active chain renders in the app header, e.g. `LLM: gemini → openrouter`.
 
 ```bash
-# Primary: Google Gemini — https://aistudio.google.com/apikey (free tier)
-GEMINI_API_KEY=...
-
-# Backup: a free OpenRouter model — https://openrouter.ai/keys
-OPENROUTER_API_KEY=...
-# free-model list: https://openrouter.ai/collections/free-models
+GEMINI_API_KEY=...        # https://aistudio.google.com/apikey
+OPENROUTER_API_KEY=...    # https://openrouter.ai/keys — free-model backup
+AI_GATEWAY_API_KEY=...    # https://vercel.com/ai-gateway — OpenAI-compatible, ~375 models
+ANTHROPIC_API_KEY=...
+OPENAI_API_KEY=...
 ```
 
-With just those two set, the chain auto-detects to **`gemini → openrouter → mock`**. Add `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` to extend it further.
+Auto-detect order, filtered to providers that have a key: `gemini → openrouter → vercel → anthropic → openai → mock`.
 
-**Default auto-detect order** (only providers with a key are included): `gemini → openrouter → anthropic → openai → mock`.
+| Variable | Effect |
+| --- | --- |
+| `LLM_PROVIDER` | Pin a single primary: `gemini\|openrouter\|vercel\|anthropic\|openai\|mock` |
+| `LLM_FALLBACK_PROVIDER` | One backup, used only when `LLM_PROVIDER` is set |
+| `GEMINI_MODEL`, `OPENROUTER_MODEL`, `AI_GATEWAY_MODEL`, `ANTHROPIC_MODEL`, `OPENAI_MODEL` | Per-provider model override |
 
-**Model overrides** (optional): `GEMINI_MODEL`, `OPENROUTER_MODEL`, `ANTHROPIC_MODEL`, `OPENAI_MODEL`.
+Two operational notes:
 
-**Pin the chain explicitly** instead of auto-detecting:
+- Gemini's free tier is ~20 requests/day **per model**; one lesson run costs ~6 before any tutor chat. Past that the chain still works, but every call first pays a failed Gemini attempt — pin `LLM_PROVIDER=openrouter` or switch `GEMINI_MODEL` (separate daily bucket) for extended demos.
+- OpenRouter retires free model slugs without notice. If the backup 404s, pick a current slug or set `OPENROUTER_MODEL=openrouter/free` to let OpenRouter route across whatever is free that day.
 
-```bash
-LLM_PROVIDER=gemini              # single primary: gemini|openrouter|anthropic|openai|mock
-LLM_FALLBACK_PROVIDER=openrouter # one backup (used only when LLM_PROVIDER is set)
+## Flow
+
+```
+Upload PDF ─► extract text ─► draft plan (objectives + difficulty)
+                                   │
+                         ⏸ HITL: review / edit / approve
+                                   │
+     ┌─────────────────────────────┴──────────────────────────────┐
+     │ per objective:                                             │
+     │   generate MCQ from the PDF text                           │
+     │   ⏸ HITL: learner answers                                  │
+     │   correct   → ⏸ reveal explanation → advance               │
+     │   incorrect → hint → retry (unlimited, no penalty)         │
+     │   skip      → advance                                      │
+     └─────────────────────────────┬──────────────────────────────┘
+                                   │
+              summary: score, strengths, focus areas, study tips
 ```
 
-See [`.env.example`](.env.example) for the full list.
-
----
+Each ⏸ is a real LangGraph `interrupt()`: the graph suspends, `/api/lesson` returns the pending payload, and a `Command({ resume })` restarts it from the checkpoint.
 
 ## Architecture
 
 ```
-Browser (Next.js / React)
- ├─ PdfUpload ─────────────► POST /api/extract-pdf ──► pdfjs-dist → text
- ├─ PlanApproval / McqCard / SummaryCard   (custom generative-UI widgets)
- │      ▲  state + pending interrupt
- │      │  POST /api/lesson  { start | resume }
- │      ▼
- └─ CopilotKit <CopilotSidebar>  ──────────► POST /api/copilotkit (tutor chat)
+Browser
+ ├─ PdfUpload ────────────────► POST /api/extract-pdf   pdfjs-dist → text
+ ├─ PlanApproval / McqCard / SummaryCard
+ │     ▲ state + pending interrupt
+ │     ▼ POST /api/lesson { start | resume }
+ └─ CopilotSidebar ───────────► POST /api/copilotkit    tutor chat
 
 Server
- ├─ /api/lesson   → drives the LangGraph agent (MemorySaver checkpointer, thread_id)
- └─ agent/graph.ts → make_plan → approve_plan⏸ → generate_question
-                       → ask_question⏸ → (reveal⏸ | retry | skip) → advance → summarize
+ ├─ /api/lesson    drives the graph; MemorySaver checkpointer keyed by thread_id
+ └─ agent/graph.ts make_plan → approve_plan⏸ → generate_question
+                   → ask_question⏸ → (reveal⏸ | retry | skip) → advance → summarize
 ```
 
-### Why the answer can't leak
+### Answer containment
 
-Cheating-resistance is enforced structurally, not just by prompt:
+The correct option is structurally unreachable from the browser, not just discouraged by prompt:
 
-- The full MCQ (with `correctOptionId` + `explanation`) lives **only in the agent's server-side state**.
-- The `/api/lesson` responses and the `question` interrupt send a **`PublicMCQ`** — the correct id and explanation are stripped ([`toPublicMCQ`](src/lib/protocol.ts)).
-- The explanation + correct id are revealed **only after** you answer correctly (the `reveal` interrupt).
-- The CopilotKit tutor is given the question and a conceptual hint via `useCopilotReadable`, but **not the answer** — so even if asked directly, it physically doesn't have it. Its system prompt also instructs it to give conceptual help and steer you back to finishing the lesson.
+- The full MCQ (`correctOptionId`, `explanation`) exists only in server-side graph state.
+- Interrupt payloads and API responses carry a `PublicMCQ` with both fields stripped ([`toPublicMCQ`](src/lib/protocol.ts)).
+- They are released only by the `reveal` interrupt, after a correct answer.
+- The tutor chat receives the question and a conceptual hint via `useCopilotReadable` — never the answer — so it cannot leak what it was never given.
+- [`agent/llm.ts`](src/agent/llm.ts) and [`agent/graph.ts`](src/agent/graph.ts) import `server-only`, making a client-side import of the answer key or the provider credentials a build error rather than a convention.
 
-### One-interrupt-per-node
+### One interrupt per node
 
-LangGraph nodes re-execute on resume, so the graph is designed with **at most one `interrupt()` per node**. Retries are modeled as a graph **edge** looping back into `ask_question` (not an in-node loop), which keeps checkpoint/resume behavior deterministic.
+LangGraph re-executes a node on resume, so each node contains at most one `interrupt()`. Retries are a conditional **edge** back into `ask_question` rather than an in-node loop, which keeps checkpoint/resume deterministic.
 
----
+### Question prefetching
 
-## Project structure
+Generating an MCQ is a 6–12s round trip. Paying it on click stalled every transition, so [`graph.ts`](src/agent/graph.ts) generates objective *n+1*'s question in the background while the learner works on *n*, and warms the first question while the plan sits in review. Measured with a 12s pause per question: plan approval → Q1 dropped from 9.6s to 0.1s, and Continue → next question from 6–12s to ~0.02s. A revised plan invalidates anything queued against the old objectives.
 
-```
-src/
-├─ agent/
-│  ├─ graph.ts       # LangGraph state machine (the lesson flow + HITL)
-│  ├─ state.ts       # graph state channels
-│  ├─ llm.ts         # provider-configurable model + mock; structured generation
-│  └─ prompts.ts     # system/user prompts for plan, MCQ, summary
-├─ app/
-│  ├─ api/
-│  │  ├─ lesson/       # start/resume the agent, returns answer-safe state
-│  │  ├─ extract-pdf/  # server-side PDF text extraction
-│  │  └─ copilotkit/   # CopilotKit runtime for the tutor chat
-│  ├─ page.tsx / layout.tsx / globals.css
-├─ components/
-│  ├─ LessonApp.tsx    # orchestrator: API state machine + tutor sidebar
-│  ├─ PdfUpload.tsx  PlanApproval.tsx  McqCard.tsx  SummaryCard.tsx  Providers.tsx
-└─ lib/
-   ├─ types.ts        # shared domain types
-   └─ protocol.ts     # HITL wire contract (interrupt / resume payloads)
-```
+### Option shuffling
 
----
+Models put the correct answer first far more often than chance — measured at 3/4 on this prompt. [`llm.ts`](src/agent/llm.ts) deals the options into a random order and re-letters them server-side after generation, which fixes the bias for every provider at once instead of relying on prompt instructions.
+
+### Structured output without tool calling
+
+`withStructuredOutput()` is deliberately unused: its JSON Schema (with `$ref` for reused enums) is rejected by Gemini's `response_schema`, and many free models have no function-calling support. Instead the prompt requests a bare JSON object, and the response is parsed and validated with zod — the most provider-agnostic path, and what makes the fallback chain viable across such different models.
+
+## Implementation map
+
+| Concern | Location |
+| --- | --- |
+| PDF text extraction | [`/api/extract-pdf`](src/app/api/extract-pdf/route.ts), [`PdfUpload`](src/components/PdfUpload.tsx) |
+| Graph, nodes, routing, prefetch | [`agent/graph.ts`](src/agent/graph.ts) |
+| State channels | [`agent/state.ts`](src/agent/state.ts) |
+| Provider chain, generation, mock | [`agent/llm.ts`](src/agent/llm.ts) |
+| Prompts | [`agent/prompts.ts`](src/agent/prompts.ts) |
+| HITL wire contract | [`lib/protocol.ts`](src/lib/protocol.ts) |
+| Start/resume endpoint | [`/api/lesson`](src/app/api/lesson/route.ts) |
+| Tutor chat runtime | [`/api/copilotkit`](src/app/api/copilotkit/route.ts) |
+| UI state machine | [`LessonApp`](src/components/LessonApp.tsx) |
+| Widgets | [`PlanApproval`](src/components/PlanApproval.tsx), [`McqCard`](src/components/McqCard.tsx), [`SummaryCard`](src/components/SummaryCard.tsx) |
 
 ## Scripts
 
-| Command | What it does |
+| Command | Purpose |
 | --- | --- |
-| `npm run dev` | Start the dev server |
-| `npm run build` | Production build (also full typecheck) |
+| `npm run dev` | Dev server |
+| `npm run build` | Production build (includes a full typecheck) |
 | `npm run start` | Serve the production build |
 | `npm run typecheck` | `tsc --noEmit` |
 
----
+## Trade-offs and limits
 
-## Notes & trade-offs
-
-- **State store:** the agent uses LangGraph's in-memory `MemorySaver` keyed by `thread_id`, which is perfect for a single-process demo. For multi-instance production you'd swap in a Postgres/Redis checkpointer — the graph code doesn't change.
-- **Scanned PDFs:** extraction is text-based; image-only PDFs (no text layer) are rejected with a clear message. Add OCR if you need them.
-- **Mock mode** is heuristic (keyword/sentence based) — great for demoing the mechanics offline, but a real key produces genuinely content-grounded questions and a working tutor chat.
+- **Checkpointer:** `MemorySaver` keyed by `thread_id` — single-process only. Swapping in a Postgres/Redis checkpointer requires no graph changes. The prefetch cache is likewise in-process.
+- **CopilotKit is pinned to 1.8.x.** Releases from 1.70 on are effectively v2 under a v1 version number: they deprecate the `LangChainAdapter` the tutor chat uses and require an explicit `BuiltInAgent` with AI SDK models. Upgrading is a migration, not a version bump, and would give up the shared LangChain provider chain. The in-app upgrade nag is switched off via `showDevConsole={false}`.
+- **Chat fallback:** the tutor chat walks the same provider chain, pulling the first stream chunk eagerly so an error surfaces early enough to fail over rather than mid-reply.
+- **Scanned PDFs:** extraction is text-layer only; image-only PDFs are rejected with an explicit message. OCR would be an added step.
+- **Mock mode** is keyword/sentence heuristics — enough to exercise every path offline, but questions are not genuinely content-grounded and the tutor chat is disabled.
