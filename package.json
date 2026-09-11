@@ -16,6 +16,7 @@
     "@copilotkit/runtime": "^1.8.14",
     "@langchain/anthropic": "^0.3.14",
     "@langchain/core": "^0.3.40",
+    "@langchain/google-genai": "^0.2.18",
     "@langchain/langgraph": "^0.2.55",
     "@langchain/openai": "^0.4.4",
     "next": "^15.1.6",

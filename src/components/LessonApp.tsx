@@ -37,7 +37,13 @@ interface LessonResponse {
   done: boolean;
 }
 
-export function LessonApp({ provider }: { provider: Provider }) {
+export function LessonApp({
+  provider,
+  chainLabel,
+}: {
+  provider: Provider;
+  chainLabel: string;
+}) {
   const [doc, setDoc] = useState<ExtractedDoc | null>(null);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [state, setState] = useState<ClientState | null>(null);
@@ -153,8 +159,8 @@ export function LessonApp({ provider }: { provider: Provider }) {
             <span className="font-semibold text-gray-900">Memorang Lesson Agent</span>
           </div>
           <div className="flex items-center gap-3 text-xs text-gray-500">
-            <span className="rounded-full bg-gray-100 px-2 py-0.5">
-              LLM: {provider}
+            <span className="rounded-full bg-gray-100 px-2 py-0.5" title="Active LLM fallback chain">
+              LLM: {chainLabel}
             </span>
             {threadId && (
               <button

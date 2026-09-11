@@ -2,7 +2,7 @@
 
 An AI learning agent that turns a **PDF into an interactive, quiz-driven lesson** — with a human-in-the-loop plan approval step, custom MCQ widgets, green/red feedback with hints and explanations, and a personalized wrap-up.
 
-Built with **LangGraph.js** (agent orchestration + real interrupt-based HITL) and **CopilotKit** (tutor chat + generative context), fully in **TypeScript** on **Next.js**. It runs against **Anthropic or OpenAI**, and ships with a **deterministic mock mode** so you can run and demo the entire flow with no API key.
+Built with **LangGraph.js** (agent orchestration + real interrupt-based HITL) and **CopilotKit** (tutor chat + generative context), fully in **TypeScript** on **Next.js**. It runs against a configurable **LLM fallback chain** (Gemini → a free OpenRouter model → Anthropic → OpenAI), and ships with a **deterministic mock mode** so you can run and demo the entire flow with no API key.
 
 ---
 
@@ -64,22 +64,33 @@ Open http://localhost:3000, upload a text-based PDF, and go.
 
 ## Configuring the LLM
 
-The provider is chosen by `LLM_PROVIDER`, or auto-detected from whichever key is present. Set these in `.env.local`:
+The agent uses a **fallback chain**: for every generation it tries the primary model, and on any error (bad key, rate limit, unsupported output) falls through to the next — ending at an offline mock so the app never hard-fails. The active chain is shown in the app header (e.g. `LLM: gemini → openrouter`).
+
+**Recommended setup — Gemini primary + a free OpenRouter backup:**
 
 ```bash
-# Pick one explicitly...
-LLM_PROVIDER=anthropic          # or "openai" or "mock"
+# Primary: Google Gemini — https://aistudio.google.com/apikey (free tier)
+GEMINI_API_KEY=...
 
-# ...and provide the matching key:
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
-
-# Optional model overrides:
-# ANTHROPIC_MODEL=claude-sonnet-5
-# OPENAI_MODEL=gpt-4o
+# Backup: a free OpenRouter model — https://openrouter.ai/keys
+OPENROUTER_API_KEY=...
+# free-model list: https://openrouter.ai/collections/free-models
 ```
 
-Auto-detection order when `LLM_PROVIDER` is unset: **Anthropic key → OpenAI key → mock**. The active provider is shown in the app header (`LLM: anthropic | openai | mock`).
+With just those two set, the chain auto-detects to **`gemini → openrouter → mock`**. Add `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` to extend it further.
+
+**Default auto-detect order** (only providers with a key are included): `gemini → openrouter → anthropic → openai → mock`.
+
+**Model overrides** (optional): `GEMINI_MODEL`, `OPENROUTER_MODEL`, `ANTHROPIC_MODEL`, `OPENAI_MODEL`.
+
+**Pin the chain explicitly** instead of auto-detecting:
+
+```bash
+LLM_PROVIDER=gemini              # single primary: gemini|openrouter|anthropic|openai|mock
+LLM_FALLBACK_PROVIDER=openrouter # one backup (used only when LLM_PROVIDER is set)
+```
+
+See [`.env.example`](.env.example) for the full list.
 
 ---
 

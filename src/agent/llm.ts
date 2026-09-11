@@ -1,9 +1,15 @@
 // Provider-configurable LLM layer for the lesson agent.
 //
-// One place decides which model (Anthropic / OpenAI / mock) powers planning,
-// MCQ generation, and the summary. Every function degrades to a deterministic
-// mock so the full flow runs with no API key — set LLM_PROVIDER=mock (or just
-// leave all keys unset) to demo offline.
+// It builds an ordered *fallback chain* of models and tries them in turn for
+// every generation (plan / MCQ / summary). If a model errors (bad key, rate
+// limit, unsupported structured output) the next one is tried, and if the whole
+// chain is exhausted it falls back to a deterministic offline mock — so the app
+// always produces a usable lesson.
+//
+// Default chain (auto-detected from whichever keys are present):
+//   Gemini  →  OpenRouter (free model)  →  Anthropic  →  OpenAI  →  mock
+//
+// Override with LLM_PROVIDER (pins a single primary) and LLM_FALLBACK_PROVIDER.
 
 import { z } from "zod";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
@@ -24,53 +30,231 @@ import {
   summaryUserPrompt,
 } from "./prompts";
 
-export type Provider = "anthropic" | "openai" | "mock";
+export type Provider =
+  | "gemini"
+  | "openrouter"
+  | "anthropic"
+  | "openai"
+  | "mock";
 
-/** Resolve the active provider from env, with auto-detection. */
-export function resolveProvider(): Provider {
+const REAL_PROVIDERS: Exclude<Provider, "mock">[] = [
+  "gemini",
+  "openrouter",
+  "anthropic",
+  "openai",
+];
+
+const DEFAULT_MODELS: Record<Exclude<Provider, "mock">, string> = {
+  gemini: "gemini-2.5-flash",
+  // A capable free model on OpenRouter that supports tool/structured output.
+  openrouter: "meta-llama/llama-3.3-70b-instruct:free",
+  anthropic: "claude-sonnet-5",
+  openai: "gpt-4o",
+};
+
+function keyFor(provider: Provider): string | undefined {
+  switch (provider) {
+    case "gemini":
+      return process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    case "openrouter":
+      return process.env.OPENROUTER_API_KEY;
+    case "anthropic":
+      return process.env.ANTHROPIC_API_KEY;
+    case "openai":
+      return process.env.OPENAI_API_KEY;
+    default:
+      return undefined;
+  }
+}
+
+function isRealProvider(v: string): v is Exclude<Provider, "mock"> {
+  return (REAL_PROVIDERS as string[]).includes(v);
+}
+
+/** Ordered list of providers to try (excludes mock). */
+export function resolveProviderChain(): Exclude<Provider, "mock">[] {
   const explicit = (process.env.LLM_PROVIDER || "").toLowerCase();
-  if (explicit === "anthropic" || explicit === "openai" || explicit === "mock") {
-    return explicit;
+
+  if (explicit === "mock") return [];
+
+  if (isRealProvider(explicit)) {
+    const chain: Exclude<Provider, "mock">[] = [explicit];
+    const fallback = (process.env.LLM_FALLBACK_PROVIDER || "").toLowerCase();
+    if (isRealProvider(fallback) && fallback !== explicit) chain.push(fallback);
+    return chain.filter((p) => keyFor(p));
   }
-  if (process.env.ANTHROPIC_API_KEY) return "anthropic";
-  if (process.env.OPENAI_API_KEY) return "openai";
-  return "mock";
+
+  // Auto: default priority order, filtered to providers that have a key.
+  return REAL_PROVIDERS.filter((p) => keyFor(p));
 }
 
-/** Whether a real (non-mock) LLM is configured — used to gate the tutor chat. */
+/** The provider that will actually be used first (for display), or "mock". */
+export function resolveProvider(): Provider {
+  return resolveProviderChain()[0] ?? "mock";
+}
+
+/** Human-readable label of the active chain, e.g. "gemini → openrouter". */
+export function providerChainLabel(): string {
+  const chain = resolveProviderChain();
+  return chain.length ? chain.join(" → ") : "mock";
+}
+
 export function hasRealLLM(): boolean {
-  return resolveProvider() !== "mock";
+  return resolveProviderChain().length > 0;
 }
 
-/** Public accessor for the raw chat model (used by the CopilotKit adapter).
- *  Returns null in mock mode. */
-export async function createChatModel() {
-  return getModel();
-}
+// Lazy-load the heavy model libs so mock mode stays light.
+async function buildModel(
+  provider: Exclude<Provider, "mock">,
+): Promise<BaseChatModel | null> {
+  const apiKey = keyFor(provider);
+  if (!apiKey) return null;
 
-// Lazy-load the heavy model libs so mock mode stays light and never imports them.
-async function getModel(): Promise<BaseChatModel | null> {
-  const provider = resolveProvider();
-  if (provider === "anthropic") {
-    const { ChatAnthropic } = await import("@langchain/anthropic");
-    return new ChatAnthropic({
-      model: process.env.ANTHROPIC_MODEL || "claude-sonnet-5",
-      temperature: 0.3,
-      maxRetries: 2,
-    });
+  switch (provider) {
+    case "gemini": {
+      const { ChatGoogleGenerativeAI } = await import("@langchain/google-genai");
+      return new ChatGoogleGenerativeAI({
+        model: process.env.GEMINI_MODEL || DEFAULT_MODELS.gemini,
+        temperature: 0.3,
+        apiKey,
+      });
+    }
+    case "openrouter": {
+      const { ChatOpenAI } = await import("@langchain/openai");
+      return new ChatOpenAI({
+        model: process.env.OPENROUTER_MODEL || DEFAULT_MODELS.openrouter,
+        temperature: 0.3,
+        apiKey,
+        configuration: {
+          baseURL: "https://openrouter.ai/api/v1",
+          defaultHeaders: { "X-Title": "Memorang Lesson Agent" },
+        },
+      });
+    }
+    case "anthropic": {
+      const { ChatAnthropic } = await import("@langchain/anthropic");
+      return new ChatAnthropic({
+        model: process.env.ANTHROPIC_MODEL || DEFAULT_MODELS.anthropic,
+        temperature: 0.3,
+        maxRetries: 2,
+        apiKey,
+      });
+    }
+    case "openai": {
+      const { ChatOpenAI } = await import("@langchain/openai");
+      return new ChatOpenAI({
+        model: process.env.OPENAI_MODEL || DEFAULT_MODELS.openai,
+        temperature: 0.3,
+        maxRetries: 2,
+        apiKey,
+      });
+    }
   }
-  if (provider === "openai") {
-    const { ChatOpenAI } = await import("@langchain/openai");
-    return new ChatOpenAI({
-      model: process.env.OPENAI_MODEL || "gpt-4o",
-      temperature: 0.3,
-      maxRetries: 2,
-    });
+}
+
+/** Build every model in the fallback chain, in order. */
+async function getCandidateModels(): Promise<BaseChatModel[]> {
+  const models: BaseChatModel[] = [];
+  for (const provider of resolveProviderChain()) {
+    const model = await buildModel(provider);
+    if (model) models.push(model);
+  }
+  return models;
+}
+
+/** The primary model (first in the chain), used by the CopilotKit tutor chat. */
+export async function createChatModel(): Promise<BaseChatModel | null> {
+  const chain = resolveProviderChain();
+  return chain.length ? buildModel(chain[0]) : null;
+}
+
+// --- Structured generation with chain fallback ------------------------------
+//
+// We deliberately DON'T use model.withStructuredOutput(): its JSON-Schema (with
+// $ref for reused enums) is rejected by Gemini's response_schema, and many free
+// OpenRouter models don't support tool/function calling at all. Prompting for
+// JSON and validating with zod ourselves is the most provider-agnostic path.
+
+/** Pull a JSON object out of a model response (handles ```json fences / prose). */
+function extractJson(text: string): unknown {
+  let s = text.trim();
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) s = fence[1].trim();
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start !== -1 && end > start) s = s.slice(start, end + 1);
+  return JSON.parse(s);
+}
+
+/** Coerce an AIMessage's content (string | parts[]) to plain text. */
+function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) =>
+        typeof c === "string" ? c : (c as { text?: string })?.text ?? "",
+      )
+      .join("");
+  }
+  return String(content ?? "");
+}
+
+async function runStructured<T>(
+  schema: z.ZodType<T>,
+  name: string,
+  system: string,
+  user: string,
+  shape: string,
+): Promise<T | null> {
+  const jsonUser = `${user}
+
+Respond with ONLY a single JSON object — no markdown, no code fences, no commentary — matching EXACTLY this shape:
+${shape}`;
+
+  const models = await getCandidateModels();
+  for (const model of models) {
+    try {
+      const res = await model.invoke([
+        { role: "system", content: system },
+        { role: "user", content: jsonUser },
+      ]);
+      const parsed = extractJson(messageText(res.content));
+      return schema.parse(parsed);
+    } catch (err) {
+      console.error(
+        `[llm] structured "${name}" failed on a model, trying next:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
   return null;
 }
 
-// --- Zod schemas for structured output --------------------------------------
+// Shape hints handed to the model (kept in sync with the zod schemas below).
+const PLAN_SHAPE = `{
+  "title": string,
+  "summary": string,
+  "overallDifficulty": "beginner" | "intermediate" | "advanced",
+  "objectives": [ { "title": string, "description": string, "difficulty": "beginner" | "intermediate" | "advanced" } ]  // 3 to 5 items, foundational -> advanced
+}`;
+
+const MCQ_SHAPE = `{
+  "question": string,
+  "options": [ {"id":"a","text":string}, {"id":"b","text":string}, {"id":"c","text":string}, {"id":"d","text":string} ],  // exactly 4
+  "correctOptionId": "a" | "b" | "c" | "d",
+  "explanation": string,  // shown after a CORRECT answer
+  "hint": string          // shown after a WRONG answer; must NOT reveal the correct option
+}`;
+
+const SUMMARY_SHAPE = `{
+  "headline": string,
+  "scoreLine": string,
+  "strengths": string[],
+  "focusAreas": string[],
+  "studyTips": string[]  // 2 to 4 concrete tips
+}`;
+
+// --- Zod schemas ------------------------------------------------------------
 
 const difficultySchema = z.enum(["beginner", "intermediate", "advanced"]);
 
@@ -114,30 +298,25 @@ export async function generatePlan(
   title: string,
   sourceText: string,
 ): Promise<LessonPlan> {
-  const model = await getModel();
-  if (model) {
-    try {
-      const structured = model.withStructuredOutput(planSchema, {
-        name: "lesson_plan",
-      });
-      const raw = (await structured.invoke([
-        { role: "system", content: PLAN_SYSTEM },
-        { role: "user", content: planUserPrompt(title, sourceText) },
-      ])) as z.infer<typeof planSchema>;
-      return {
-        title: raw.title,
-        summary: raw.summary,
-        overallDifficulty: raw.overallDifficulty,
-        objectives: raw.objectives.map((o, i) => ({
-          id: `obj-${i + 1}`,
-          title: o.title,
-          description: o.description,
-          difficulty: o.difficulty,
-        })),
-      };
-    } catch (err) {
-      console.error("[llm] generatePlan failed, using mock:", err);
-    }
+  const raw = await runStructured(
+    planSchema,
+    "lesson_plan",
+    PLAN_SYSTEM,
+    planUserPrompt(title, sourceText),
+    PLAN_SHAPE,
+  );
+  if (raw) {
+    return {
+      title: raw.title,
+      summary: raw.summary,
+      overallDifficulty: raw.overallDifficulty,
+      objectives: raw.objectives.map((o, i) => ({
+        id: `obj-${i + 1}`,
+        title: o.title,
+        description: o.description,
+        difficulty: o.difficulty,
+      })),
+    };
   }
   return mockPlan(title, sourceText);
 }
@@ -147,33 +326,27 @@ export async function generateMCQ(
   sourceText: string,
   avoidQuestions: string[],
 ): Promise<MCQ> {
-  const model = await getModel();
-  if (model) {
-    try {
-      const structured = model.withStructuredOutput(mcqSchema, { name: "mcq" });
-      const raw = (await structured.invoke([
-        { role: "system", content: MCQ_SYSTEM },
-        {
-          role: "user",
-          content: mcqUserPrompt(
-            objective.title,
-            objective.description,
-            sourceText,
-            avoidQuestions,
-          ),
-        },
-      ])) as z.infer<typeof mcqSchema>;
-      return {
-        objectiveId: objective.id,
-        question: raw.question,
-        options: raw.options,
-        correctOptionId: raw.correctOptionId,
-        explanation: raw.explanation,
-        hint: raw.hint,
-      };
-    } catch (err) {
-      console.error("[llm] generateMCQ failed, using mock:", err);
-    }
+  const raw = await runStructured(
+    mcqSchema,
+    "mcq",
+    MCQ_SYSTEM,
+    mcqUserPrompt(
+      objective.title,
+      objective.description,
+      sourceText,
+      avoidQuestions,
+    ),
+    MCQ_SHAPE,
+  );
+  if (raw) {
+    return {
+      objectiveId: objective.id,
+      question: raw.question,
+      options: raw.options,
+      correctOptionId: raw.correctOptionId,
+      explanation: raw.explanation,
+      hint: raw.hint,
+    };
   }
   return mockMCQ(objective, sourceText, avoidQuestions.length);
 }
@@ -182,33 +355,18 @@ export async function generateSummary(
   plan: LessonPlan,
   results: ObjectiveResult[],
 ): Promise<LessonSummary> {
-  const model = await getModel();
-  if (model) {
-    try {
-      const structured = model.withStructuredOutput(summarySchema, {
-        name: "summary",
-      });
-      const raw = (await structured.invoke([
-        { role: "system", content: SUMMARY_SYSTEM },
-        {
-          role: "user",
-          content: summaryUserPrompt(
-            JSON.stringify(plan),
-            JSON.stringify(results),
-          ),
-        },
-      ])) as z.infer<typeof summarySchema>;
-      return raw;
-    } catch (err) {
-      console.error("[llm] generateSummary failed, using mock:", err);
-    }
-  }
-  return mockSummary(plan, results);
+  const raw = await runStructured(
+    summarySchema,
+    "summary",
+    SUMMARY_SYSTEM,
+    summaryUserPrompt(JSON.stringify(plan), JSON.stringify(results)),
+    SUMMARY_SHAPE,
+  );
+  return raw ?? mockSummary(plan, results);
 }
 
 // --- Mock implementations (deterministic, no network) -----------------------
 
-/** Split text into reasonably clean sentences. */
 function sentences(text: string): string[] {
   return text
     .replace(/\s+/g, " ")
@@ -217,7 +375,6 @@ function sentences(text: string): string[] {
     .filter((s) => s.length > 40 && s.length < 320);
 }
 
-/** Cheap keyword extraction: most frequent non-trivial words. */
 function keywords(text: string, n: number): string[] {
   const stop = new Set(
     "the a an and or but of to in on for with as by at from is are was were be been being this that these those it its their there which who whom whose will would can could should may might must not no yes you your we our they them he she his her".split(
@@ -243,14 +400,14 @@ function mockPlan(title: string, sourceText: string): LessonPlan {
   const kws = keywords(sourceText, 5);
   const subject = title?.trim() || (kws[0] ? titleCase(kws[0]) : "the material");
   const diffs: Difficulty[] = ["beginner", "intermediate", "advanced"];
-  const objectives: LearningObjective[] = (kws.length ? kws.slice(0, 3) : ["core concepts", "key details", "applications"]).map(
-    (kw, i) => ({
-      id: `obj-${i + 1}`,
-      title: `Understand ${kw}`,
-      description: `Explain the role of ${kw} as presented in ${subject}.`,
-      difficulty: diffs[Math.min(i, diffs.length - 1)],
-    }),
-  );
+  const objectives: LearningObjective[] = (
+    kws.length ? kws.slice(0, 3) : ["core concepts", "key details", "applications"]
+  ).map((kw, i) => ({
+    id: `obj-${i + 1}`,
+    title: `Understand ${kw}`,
+    description: `Explain the role of ${kw} as presented in ${subject}.`,
+    difficulty: diffs[Math.min(i, diffs.length - 1)],
+  }));
   return {
     title: `Lesson: ${subject}`,
     summary: `A short interactive lesson covering the key ideas in ${subject}. (Generated in mock mode — set an API key for richer, content-grounded questions.)`,
@@ -266,15 +423,13 @@ function mockMCQ(
 ): MCQ {
   const sents = sentences(sourceText);
   const fact =
-    sents[(askedCount * 3) % Math.max(sents.length, 1)] ||
-    objective.description;
+    sents[(askedCount * 3) % Math.max(sents.length, 1)] || objective.description;
   const correct = fact.length > 140 ? fact.slice(0, 137) + "…" : fact;
   const distractors = [
     "It is explicitly described as irrelevant to the topic.",
     "The document states the opposite of this.",
     "This is never mentioned anywhere in the document.",
   ];
-  // Shuffle deterministically so the correct answer isn't always "a".
   const correctSlot = askedCount % 4;
   const options = [] as MCQ["options"];
   const ids = ["a", "b", "c", "d"] as const;
