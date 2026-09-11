@@ -378,7 +378,7 @@ const OPTION_IDS = ["a", "b", "c", "d"] as const;
  * better than chance. Shuffling server-side fixes that for every provider at once,
  * and costs nothing, whereas asking the model to vary the position is unreliable.
  */
-function shuffleOptions(
+export function shuffleOptions(
   options: MCQ["options"],
   correctOptionId: string,
 ): { options: MCQ["options"]; correctOptionId: string } {

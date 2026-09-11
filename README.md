@@ -127,6 +127,18 @@ Models put the correct answer first far more often than chance — measured at 3
 | `npm run build` | Production build (includes a full typecheck) |
 | `npm run start` | Serve the production build |
 | `npm run typecheck` | `tsc --noEmit` |
+| `npm test` | Vitest run (`npm run test:watch` to watch) |
+
+## Tests
+
+`npm test` covers the pure logic that would fail silently in the UI:
+
+- `toPublicMCQ` strips the answer key from every payload that crosses the wire, asserted on the serialized JSON rather than the object.
+- `shuffleOptions` keeps `correctOptionId` on the correct text across 2,000 shuffles, re-letters `a`–`d`, spreads the answer across all four positions, and handles duplicate option texts.
+- `afterAsk` / `afterAdvance` route correctly, including the off-by-one where the index equals the objective count.
+- The `/api/lesson` request schema accepts each resume verb and rejects unknown verbs, malformed plans and non-string option ids.
+
+The suite is node-only and network-free; `server-only` is aliased to a stub in [`vitest.config.mts`](vitest.config.mts), since that guard is enforced by `next build`.
 
 ## Trade-offs and limits
 

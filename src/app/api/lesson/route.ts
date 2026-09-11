@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { Command, lessonGraph } from "@/agent/graph";
-import type { LessonInterrupt, LessonResume } from "@/lib/protocol";
+import type { LessonInterrupt } from "@/lib/protocol";
+import { firstIssue, lessonRequestSchema } from "./schema";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -43,42 +44,37 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
   }
 
-  const data = body as Record<string, unknown>;
+  // Parse before the graph sees any of it: nodes index into plan.objectives and
+  // compare optionId against the answer key, so a malformed body should fail
+  // here with a 400 rather than deep inside a node.
+  const parsed = lessonRequestSchema.safeParse(body);
+  if (!parsed.success) {
+    const message = firstIssue(parsed.error);
+    // Well-formed request, unusable document: the old handler answered 422 for
+    // this case and the UI surfaces it differently from a protocol error.
+    const status = message.includes("too short to build a lesson") ? 422 : 400;
+    return NextResponse.json({ error: message }, { status });
+  }
+  const data = parsed.data;
 
   try {
     if (data.action === "start") {
-      const documentTitle = String(data.documentTitle ?? "");
-      const sourceText = String(data.sourceText ?? "");
-      if (sourceText.trim().length < 40) {
-        return NextResponse.json(
-          { error: "Extracted document text is too short to build a lesson." },
-          { status: 422 },
-        );
-      }
       const threadId = randomUUID();
       const config = { configurable: { thread_id: threadId } };
       await lessonGraph.invoke(
-        { documentTitle, sourceText, phase: "planning" },
+        {
+          documentTitle: data.documentTitle,
+          sourceText: data.sourceText,
+          phase: "planning",
+        },
         config,
       );
       return NextResponse.json(await readSnapshot(threadId));
     }
 
-    if (data.action === "resume") {
-      const threadId = String(data.threadId ?? "");
-      if (!threadId) {
-        return NextResponse.json(
-          { error: "threadId is required to resume" },
-          { status: 400 },
-        );
-      }
-      const resume = data.resume as LessonResume;
-      const config = { configurable: { thread_id: threadId } };
-      await lessonGraph.invoke(new Command({ resume }), config);
-      return NextResponse.json(await readSnapshot(threadId));
-    }
-
-    return NextResponse.json({ error: "unknown action" }, { status: 400 });
+    const config = { configurable: { thread_id: data.threadId } };
+    await lessonGraph.invoke(new Command({ resume: data.resume }), config);
+    return NextResponse.json(await readSnapshot(data.threadId));
   } catch (err) {
     console.error("[/api/lesson] error:", err);
     return NextResponse.json(

@@ -278,7 +278,7 @@ async function summarizeNode(
 
 // --- Routing ----------------------------------------------------------------
 
-function afterAsk(
+export function afterAsk(
   state: LessonGraphState,
 ): "reveal" | "ask_question" | "advance" {
   if (state.route === "correct") return "reveal";
@@ -286,7 +286,7 @@ function afterAsk(
   return "ask_question"; // retry
 }
 
-function afterAdvance(
+export function afterAdvance(
   state: LessonGraphState,
 ): "generate_question" | "summarize" {
   return state.currentObjectiveIndex >= state.plan!.objectives.length
