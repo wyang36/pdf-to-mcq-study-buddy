@@ -62,11 +62,12 @@ const DEFAULT_MODELS: Record<Exclude<Provider, "mock">, string> = {
   // rot-proof alternative — it auto-routes across whatever is free today — but it
   // is slower and less predictable, so we pin a specific model here.
   openrouter: "nvidia/nemotron-3-super-120b-a12b:free",
-  // The gateway fronts many providers under "vendor/model" slugs. Defaulting to
-  // the same model family as the primary keeps question quality consistent when
-  // this backup takes over, while drawing on Vercel's quota rather than the
-  // Gemini free tier that just ran out. Full list: https://ai-gateway.vercel.sh/v1/models
-  vercel: "google/gemini-3-flash",
+  // The gateway fronts many providers under "vendor/model" slugs, including
+  // several priced at zero. This one was the fastest candidate that produced
+  // valid JSON on our own MCQ prompt when benchmarked through OpenRouter
+  // (2/2 valid, ~3.5s), and it is general-purpose rather than domain-tuned like
+  // its -fin and -sante siblings. Full list: https://ai-gateway.vercel.sh/v1/models
+  vercel: "inclusionai/ling-3.0-flash-vl",
   anthropic: "claude-sonnet-5",
   openai: "gpt-4o",
 };
@@ -137,7 +138,8 @@ async function buildModel(
 
   switch (provider) {
     case "gemini": {
-      const { ChatGoogleGenerativeAI } = await import("@langchain/google-genai");
+      const { ChatGoogleGenerativeAI } =
+        await import("@langchain/google-genai");
       return new ChatGoogleGenerativeAI({
         model: process.env.GEMINI_MODEL || DEFAULT_MODELS.gemini,
         temperature: 0.3,
@@ -221,6 +223,40 @@ export async function createChatModels(): Promise<BaseChatModel[]> {
 // OpenRouter models don't support tool/function calling at all. Prompting for
 // JSON and validating with zod ourselves is the most provider-agnostic path.
 
+// A single attempt is capped so one stalled provider cannot hold the whole
+// request hostage. Observed in practice: Gemini answering "experiencing high
+// demand" after 58 seconds, which the learner experiences as a dead app rather
+// than a failover. The chain only has value if moving down it is quick.
+const ATTEMPT_TIMEOUT_MS = Number(process.env.LLM_ATTEMPT_TIMEOUT_MS || 20_000);
+
+/**
+ * Wall-clock cap on one attempt.
+ *
+ * An AbortSignal alone is not enough: @langchain/google-genai does not honour
+ * one promptly (measured — a 300ms signal surfaced after 2.3s), so a provider
+ * having a bad day can hold the request far past its budget. We pass the signal
+ * anyway for the clients that do respect it, and race it so that we stop waiting
+ * regardless. The losing promise is swallowed rather than left to reject
+ * unhandled; the request may still be in flight, but nobody is waiting on it.
+ */
+export function withDeadline<T>(
+  work: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} exceeded ${ms}ms budget`)),
+      ms,
+    );
+  });
+  work.catch(() => {});
+  return Promise.race([work, deadline]).finally(() =>
+    clearTimeout(timer),
+  ) as Promise<T>;
+}
+
 /** Pull a JSON object out of a model response (handles ```json fences / prose). */
 function extractJson(text: string): unknown {
   let s = text.trim();
@@ -238,7 +274,7 @@ function messageText(content: unknown): string {
   if (Array.isArray(content)) {
     return content
       .map((c) =>
-        typeof c === "string" ? c : (c as { text?: string })?.text ?? "",
+        typeof c === "string" ? c : ((c as { text?: string })?.text ?? ""),
       )
       .join("");
   }
@@ -260,10 +296,17 @@ ${shape}`;
   const models = await getCandidateModels();
   for (const model of models) {
     try {
-      const res = await model.invoke([
-        { role: "system", content: system },
-        { role: "user", content: jsonUser },
-      ]);
+      const res = await withDeadline(
+        model.invoke(
+          [
+            { role: "system", content: system },
+            { role: "user", content: jsonUser },
+          ],
+          { signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS) },
+        ),
+        ATTEMPT_TIMEOUT_MS,
+        `${name} attempt`,
+      );
       const parsed = extractJson(messageText(res.content));
       return schema.parse(parsed);
     } catch (err) {
@@ -474,10 +517,13 @@ function titleCase(s: string): string {
 
 function mockPlan(title: string, sourceText: string): LessonPlan {
   const kws = keywords(sourceText, 5);
-  const subject = title?.trim() || (kws[0] ? titleCase(kws[0]) : "the material");
+  const subject =
+    title?.trim() || (kws[0] ? titleCase(kws[0]) : "the material");
   const diffs: Difficulty[] = ["beginner", "intermediate", "advanced"];
   const objectives: LearningObjective[] = (
-    kws.length ? kws.slice(0, 3) : ["core concepts", "key details", "applications"]
+    kws.length
+      ? kws.slice(0, 3)
+      : ["core concepts", "key details", "applications"]
   ).map((kw, i) => ({
     id: `obj-${i + 1}`,
     title: `Understand ${kw}`,
@@ -499,7 +545,8 @@ function mockMCQ(
 ): MCQ {
   const sents = sentences(sourceText);
   const fact =
-    sents[(askedCount * 3) % Math.max(sents.length, 1)] || objective.description;
+    sents[(askedCount * 3) % Math.max(sents.length, 1)] ||
+    objective.description;
   const correct = fact.length > 140 ? fact.slice(0, 137) + "…" : fact;
   const distractors = [
     "It is explicitly described as irrelevant to the topic.",
@@ -545,11 +592,14 @@ function mockSummary(
         : "Nice progress — you worked through the lesson.",
     scoreLine: `You solved ${solved} of ${total} objectives, on the first try for ${firstTry.length}.`,
     strengths: firstTry.length
-      ? firstTry.map((r) => `Nailed "${byId.get(r.objectiveId)}" on the first attempt.`)
+      ? firstTry.map(
+          (r) => `Nailed "${byId.get(r.objectiveId)}" on the first attempt.`,
+        )
       : ["You stuck with each question until you got it right."],
     focusAreas: struggled.length
       ? struggled.map(
-          (r) => `"${byId.get(r.objectiveId)}" took ${r.attempts} attempts — worth another review.`,
+          (r) =>
+            `"${byId.get(r.objectiveId)}" took ${r.attempts} attempts — worth another review.`,
         )
       : ["No major weak spots — consider a harder pass on the material."],
     studyTips: [

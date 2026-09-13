@@ -14,7 +14,7 @@ import {
 } from "@copilotkit/runtime";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { IterableReadableStream } from "@langchain/core/utils/stream";
-import { createChatModels } from "@/agent/llm";
+import { createChatModels, withDeadline } from "@/agent/llm";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,14 +38,23 @@ export async function POST(req: NextRequest) {
         let lastError: unknown;
         for (const model of models) {
           try {
+            const budgetMs = Number(process.env.LLM_ATTEMPT_TIMEOUT_MS || 20_000);
             const iterator = (
-              await withTools(model, tools).stream(messages)
+              await withTools(model, tools).stream(messages, {
+                // Same cap as lesson generation: a stalled provider should hand
+                // off to the next one, not leave the sidebar spinning.
+                signal: AbortSignal.timeout(budgetMs),
+              })
             )[Symbol.asyncIterator]();
             // Pull the first chunk here: a stream only issues its HTTP request
             // when it is read, so rate limits and bad models surface on this
             // line rather than mid-reply, which is what lets us fall through
             // to the next provider instead of erroring in the sidebar.
-            const first = await iterator.next();
+            const first = await withDeadline(
+              iterator.next(),
+              budgetMs,
+              "chat first chunk",
+            );
             return IterableReadableStream.fromAsyncGenerator(
               (async function* () {
                 for (let res = first; !res.done; res = await iterator.next()) {

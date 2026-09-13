@@ -36,9 +36,14 @@ Auto-detect order, filtered to providers that have a key: `gemini → openrouter
 | `LLM_FALLBACK_PROVIDER` | One backup, used only when `LLM_PROVIDER` is set |
 | `GEMINI_MODEL`, `OPENROUTER_MODEL`, `AI_GATEWAY_MODEL`, `ANTHROPIC_MODEL`, `OPENAI_MODEL` | Per-provider model override |
 
-Two operational notes:
+Each attempt is capped by `LLM_ATTEMPT_TIMEOUT_MS` (default 25s). Without it a provider having a bad
+day stalls the whole request — measured: Gemini returning "experiencing high demand" after 58
+seconds, which a learner experiences as a dead app rather than a failover.
+
+Three operational notes:
 
 - Gemini's free tier is ~20 requests/day **per model**; one lesson run costs ~6 before any tutor chat. Past that the chain still works, but every call first pays a failed Gemini attempt — pin `LLM_PROVIDER=openrouter` or switch `GEMINI_MODEL` (separate daily bucket) for extended demos.
+- OpenRouter's free tier has a daily request cap of its own (it suggests adding credits to raise it), so the free backup can be exhausted independently of Gemini. When both are spent the chain ends at the mock, which still runs the whole flow but with heuristic questions — check the header if output suddenly looks generic.
 - OpenRouter retires free model slugs without notice. If the backup 404s, pick a current slug or set `OPENROUTER_MODEL=openrouter/free` to let OpenRouter route across whatever is free that day.
 
 ## Flow
@@ -100,6 +105,34 @@ Generating an MCQ is a 6–12s round trip. Paying it on click stalled every tran
 
 Models put the correct answer first far more often than chance — measured at 3/4 on this prompt. [`llm.ts`](src/agent/llm.ts) deals the options into a random order and re-letters them server-side after generation, which fixes the bias for every provider at once instead of relying on prompt instructions.
 
+### Generative UI: the widgets are tool calls too
+
+Both human-in-the-loop moments are registered as CopilotKit actions with
+`renderAndWaitForResponse` ([LessonApp.tsx](src/components/LessonApp.tsx)), so the agent can render the
+real `PlanApproval` / `McqCard` widget inside the chat thread and suspend until the learner acts —
+the same components the page renders, hitting the same `/api/lesson` round trip, so the graph stays
+the single source of truth and the two surfaces cannot disagree.
+
+Neither action takes the plan or the question as a parameter. They render from the snapshot the page
+already holds, so the agent controls only *when* a widget appears — it cannot invent a question,
+reword an option, or supply an answer key it was never given. What it gets back is the outcome
+("correct, explanation shown …" / "incorrect, hint shown …"), which is also how the tutor learns a
+retry is available without learning the answer.
+
+`useCopilotAdditionalInstructions` rebinds the tutor's instructions to the current phase (no lesson /
+awaiting approval / on objective *n*, attempt *k* / done), which is what makes the "steer the learner
+back to completing the lesson" requirement concrete rather than aspirational — a static prompt cannot
+know where in the lesson someone is.
+
+`useCopilotChatSuggestions` was tried and removed: it drives CopilotKit's `extract()`, which forces
+the model into one specific tool call and logs `extract() failed: No function call occurred` whenever
+the model answers with text instead, which these providers do for its `object[]` schema. It also
+spends an extra model request per phase change, which is costly against a 20-request daily tier.
+
+Note this makes the tutor path depend on tool calling, which not every free model supports. Verified
+working on both the Gemini primary and the current free OpenRouter backup; a future backup swap
+should be checked for it.
+
 ### Structured output without tool calling
 
 `withStructuredOutput()` is deliberately unused: its JSON Schema (with `$ref` for reused enums) is rejected by Gemini's `response_schema`, and many free models have no function-calling support. Instead the prompt requests a bare JSON object, and the response is parsed and validated with zod — the most provider-agnostic path, and what makes the fallback chain viable across such different models.
@@ -145,5 +178,6 @@ The suite is node-only and network-free; `server-only` is aliased to a stub in [
 - **Checkpointer:** `MemorySaver` keyed by `thread_id` — single-process only. Swapping in a Postgres/Redis checkpointer requires no graph changes. The prefetch cache is likewise in-process.
 - **CopilotKit is pinned to 1.8.x.** Releases from 1.70 on are effectively v2 under a v1 version number: they deprecate the `LangChainAdapter` the tutor chat uses and require an explicit `BuiltInAgent` with AI SDK models. Upgrading is a migration, not a version bump, and would give up the shared LangChain provider chain. The in-app upgrade nag is switched off via `showDevConsole={false}`.
 - **Chat fallback:** the tutor chat walks the same provider chain, pulling the first stream chunk eagerly so an error surfaces early enough to fail over rather than mid-reply.
+- **Lesson shape is deliberate, not tuned:** 3–5 objectives, one MCQ each, so a 30-page PDF yields the same five questions as a 3-page one. Scaling the objective count with document length, or asking more than one question per objective, is a count change rather than a redesign — the graph loop is already per objective.
 - **Scanned PDFs:** extraction is text-layer only; image-only PDFs are rejected with an explicit message. OCR would be an added step.
 - **Mock mode** is keyword/sentence heuristics — enough to exercise every path offline, but questions are not genuinely content-grounded and the tutor chat is disabled.

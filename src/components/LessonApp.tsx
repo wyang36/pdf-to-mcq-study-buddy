@@ -1,7 +1,11 @@
 "use client";
 
-import { useState } from "react";
-import { useCopilotReadable } from "@copilotkit/react-core";
+import { useEffect, useState } from "react";
+import {
+  useCopilotAction,
+  useCopilotAdditionalInstructions,
+  useCopilotReadable,
+} from "@copilotkit/react-core";
 import { CopilotSidebar } from "@copilotkit/react-ui";
 import type { LessonPlan } from "@/lib/types";
 import type { LearningObjective } from "@/lib/types";
@@ -105,7 +109,11 @@ export function LessonApp({
     }
   }
 
-  async function callLesson(body: Record<string, unknown>) {
+  // Returns the snapshot as well as applying it, so a generative-UI tool call can
+  // tell the agent what happened without re-reading React state it cannot see.
+  async function callLesson(
+    body: Record<string, unknown>,
+  ): Promise<LessonResponse | null> {
     setBusy(true);
     setError(null);
     try {
@@ -113,12 +121,28 @@ export function LessonApp({
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
+        // Generation legitimately takes 10-20s when the chain falls through to a
+        // backup, but a request that never settles leaves the button spinning
+        // forever with no way back — which is what a dev-server recompile does to
+        // an in-flight fetch. Fail loudly instead of hanging.
+        signal: AbortSignal.timeout(120_000),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Something went wrong");
       applyResponse(data as LessonResponse);
+      return data as LessonResponse;
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong");
+      const timedOut =
+        e instanceof DOMException &&
+        (e.name === "TimeoutError" || e.name === "AbortError");
+      setError(
+        timedOut
+          ? "That took too long and was cancelled. The model chain may be rate limited — try again."
+          : e instanceof Error
+            ? e.message
+            : "Something went wrong",
+      );
+      return null;
     } finally {
       setBusy(false);
     }
@@ -144,11 +168,156 @@ export function LessonApp({
     setError(null);
   }
 
+  // CopilotKit's "Powered by" tag calls a useDarkMode() that branches on
+  // `typeof window === "undefined"` during render (react-ui 1.8.14,
+  // chunk-JGMFJZMG.mjs), so the server emits the light colour and a dark-mode
+  // browser hydrates with the dark one — the first case Next's hydration error
+  // lists. The markup is theirs and showPoweredBy is derived internally from
+  // holding a CopilotKit Cloud key, so the fix available to us is to keep the
+  // chat out of the server render. Nothing is lost: the panel is interactive-only
+  // and starts closed, and the readables, actions and instructions are registered
+  // by hooks above rather than by this subtree.
+  const [chatMounted, setChatMounted] = useState(false);
+  useEffect(() => setChatMounted(true), []);
+
   const showQuiz =
     activeQuestion &&
     (interrupt?.kind === "question" || interrupt?.kind === "reveal_correct");
   const showPlan = interrupt?.kind === "approve_plan" && state?.plan;
   const showSummary = state?.phase === "done" && state.summary && state.plan;
+
+  // --- Generative UI --------------------------------------------------------
+  //
+  // Both human-in-the-loop moments are exposed as tool calls, so the agent can
+  // render the real widget inside the chat thread and WAIT for the learner,
+  // rather than telling them to go click the page. Same components as the page
+  // uses, same server round trip, so the graph stays the single source of truth
+  // and the two surfaces cannot disagree.
+  //
+  // Neither action takes the plan or the question as a parameter. They render
+  // from the snapshot the page already holds, which means the agent cannot
+  // invent a question, reword an option, or smuggle in an answer key it does not
+  // have. All it controls is WHEN the widget appears.
+
+  useCopilotAction(
+    {
+      name: "reviewLessonPlan",
+      description:
+        "Show the learner their draft lesson plan and wait for them to approve or edit it. Use this when the lesson is waiting on plan approval.",
+      renderAndWaitForResponse: ({ status, respond }) => {
+        if (!state?.plan || interrupt?.kind !== "approve_plan") {
+          return (
+            <p className="text-sm text-gray-500">
+              No lesson plan is waiting for review right now.
+            </p>
+          );
+        }
+        return (
+          <PlanApproval
+            plan={state.plan}
+            busy={busy || status === "complete"}
+            onApprove={async () => {
+              await resume({ action: "approve" });
+              respond?.(
+                "The learner approved the plan as drafted. The first question is ready.",
+              );
+            }}
+            onRevise={async (plan) => {
+              await resume({ action: "revise", plan });
+              respond?.(
+                `The learner edited the plan down to ${plan.objectives.length} objectives and approved it.`,
+              );
+            }}
+          />
+        );
+      },
+    },
+    [state?.plan, interrupt?.kind, busy],
+  );
+
+  useCopilotAction(
+    {
+      name: "answerMcq",
+      description:
+        "Show the learner the question they are currently on and wait for them to submit an answer. Use this when they say they are ready to answer, or after you have explained a concept they were stuck on.",
+      renderAndWaitForResponse: ({ status, respond }) => {
+        if (!activeQuestion) {
+          return (
+            <p className="text-sm text-gray-500">
+              There is no active question — the lesson is either not started or
+              already finished.
+            </p>
+          );
+        }
+        return (
+          <McqCard
+            mcq={activeQuestion.mcq}
+            objective={activeQuestion.objective}
+            objectiveNumber={activeQuestion.objectiveNumber}
+            objectiveTotal={activeQuestion.objectiveTotal}
+            attempts={activeQuestion.attempts}
+            feedback={feedback}
+            busy={busy || status === "complete"}
+            onSubmit={async (optionId) => {
+              const data = await resume({ action: "answer", optionId });
+              const next = data?.interrupt;
+              if (next?.kind === "reveal_correct") {
+                respond?.(
+                  `Correct. The explanation shown to the learner was: ${next.explanation}. Congratulate them briefly and offer to continue.`,
+                );
+              } else if (next?.kind === "question") {
+                // The retry is free, and the agent still does not learn the
+                // answer — only the hint the graph chose to release.
+                respond?.(
+                  `Incorrect. The learner can retry at no penalty. The hint shown was: ${next.mcq.hint}. You still do NOT know which option is correct, so do not guess it. Offer to explain the concept, then call answerMcq again when they are ready.`,
+                );
+              } else {
+                respond?.("Answer submitted.");
+              }
+            }}
+            onContinue={async () => {
+              await resume({ action: "continue" });
+              respond?.("The learner moved on to the next objective.");
+            }}
+            onSkip={async () => {
+              await resume({ action: "skip" });
+              respond?.(
+                "The learner skipped this question. It is recorded as unsolved and no explanation was revealed.",
+              );
+            }}
+          />
+        );
+      },
+    },
+    [activeQuestion, feedback, busy],
+  );
+
+  // No useCopilotChatSuggestions here on purpose. It drives CopilotKit's
+  // extract(), which forces the model to answer one specific tool call and
+  // throws "extract() failed: No function call occurred" when the model replies
+  // with text instead — which our providers do for its object[] schema. It also
+  // spends an extra model request on every phase change, which is expensive
+  // against a 20-request daily free tier. The instructions hook below is the
+  // part that was actually carrying weight.
+  //
+  // Phase-bound instructions. The static tutor prompt cannot know whether the
+  // learner is mid-question or staring at a finished summary; this does, and it
+  // is what makes "steer them back to the lesson" concrete rather than a wish.
+  useCopilotAdditionalInstructions(
+    {
+      instructions: !threadId
+        ? "The learner has not started a lesson yet. If they ask to begin, tell them to upload a PDF on the page first."
+        : interrupt?.kind === "approve_plan"
+          ? "The lesson is waiting for the learner to approve their plan. Call reviewLessonPlan to show it to them instead of describing it in prose."
+          : activeQuestion
+            ? `The learner is on objective ${activeQuestion.objectiveNumber} of ${activeQuestion.objectiveTotal}, attempt ${activeQuestion.attempts + 1}. Answer conceptual questions about it, then call answerMcq so they can submit. Never state or hint which lettered option is correct; you do not have it.`
+            : state?.phase === "done"
+              ? "The lesson is complete and the summary is on screen. Help the learner interpret it or plan what to study next; do not invent new questions."
+              : "A question is being generated. Keep the learner oriented and do not start a parallel quiz in chat.",
+    },
+    [threadId, interrupt?.kind, activeQuestion, state?.phase],
+  );
+
 
   return (
     <div className="min-h-screen">
@@ -272,18 +441,20 @@ export function LessonApp({
         )}
       </main>
 
-      <CopilotSidebar
-        defaultOpen={false}
-        clickOutsideToClose
-        labels={{
-          title: "Study Buddy",
-          initial:
-            provider === "mock"
-              ? "Tutor chat needs an API key. Add GEMINI_API_KEY (or any other provider key) to .env.local and restart the server to chat with me."
-              : "Hi! I'm your tutor. Ask me to explain a concept or give you a hint — but I won't give away the answer. 😉",
-        }}
-        instructions={TUTOR_INSTRUCTIONS}
-      />
+      {chatMounted && (
+        <CopilotSidebar
+          defaultOpen={false}
+          clickOutsideToClose
+          labels={{
+            title: "Study Buddy",
+            initial:
+              provider === "mock"
+                ? "Tutor chat needs an API key. Add GEMINI_API_KEY (or any other provider key) to .env.local and restart the server to chat with me."
+                : "Hi! I'm your tutor. Ask me to explain a concept or give you a hint — but I won't give away the answer. 😉",
+          }}
+          instructions={TUTOR_INSTRUCTIONS}
+        />
+      )}
     </div>
   );
 }
